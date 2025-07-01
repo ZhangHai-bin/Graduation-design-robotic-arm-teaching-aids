@@ -1,0 +1,170 @@
+#include <iostream>
+#include <cstdio>
+#include <vector>
+#include <chrono>
+#include "serialPort/SerialPort.h"
+#include <unistd.h>
+#include <math.h>
+#include <cstdlib>
+#include <termios.h>  // Linux 终端控制
+#include <fcntl.h>    // 文件控制
+#define MOTOR_COUNT 3        
+#define TIME_STEP 0.01       
+#define PI 3.1415926
+
+using namespace std;
+using namespace chrono;
+
+// 设置终端为非阻塞模式
+void setNonBlockingMode() {
+    struct termios ttystate;
+    tcgetattr(STDIN_FILENO, &ttystate);
+    ttystate.c_lflag &= ~ICANON; // 关闭标准输入的缓冲模式
+    ttystate.c_lflag &= ~ECHO;   // 关闭回显
+    tcsetattr(STDIN_FILENO, TCSANOW, &ttystate);
+    fcntl(STDIN_FILENO, F_SETFL, fcntl(STDIN_FILENO, F_GETFL) | O_NONBLOCK); // 设置为非阻塞
+}
+
+// 检测键盘是否有输入
+bool kbhit() {
+    struct timeval tv = { 0, 0 };
+    fd_set fds;
+    FD_ZERO(&fds);
+    FD_SET(STDIN_FILENO, &fds);
+    return select(STDIN_FILENO + 1, &fds, NULL, NULL, &tv) > 0;
+}
+
+// 读取按下的键
+char getch() {
+    char buf = 0;
+    if (read(STDIN_FILENO, &buf, 1) > 0) {
+        return buf;
+    }
+    return 0;
+}
+
+// 记录轨迹
+vector<pair<double, double>> trajectory;
+bool isRecording = false;
+bool isReplaying = false;
+bool isReturning = true;  // 是否处于归位阶段
+
+int main() {
+    SerialPort serial("/dev/ttyUSB0");
+    MotorCmd cmd;
+    MotorData data;
+    usleep(1000000);
+    setNonBlockingMode();  // 设置终端为非阻塞模式
+
+    // 记录电机初始位置
+    double init_Pos[MOTOR_COUNT];
+    for (int i = 0; i < MOTOR_COUNT; i++) {
+        cmd.motorType = MotorType::GO_M8010_6;
+        cmd.id = i;
+        cmd.mode = 0; // 读取模式
+        serial.sendRecv(&cmd, &data);
+        init_Pos[i] = data.Pos; // 保存初始位置
+        printf("Motor %d Init Pos: %f rad\n", i, data.Pos);
+        usleep(200);
+    }
+
+    cout << "按 'y' 开始记录轨迹..." << endl;
+    while (!isRecording) {
+        if (kbhit() && getch() == 'y') {
+            isRecording = true;
+            cout << "开始记录轨迹..." << endl;
+        }
+    }
+
+    FILE* pipe = popen("python3 /home/jetson/zhb1230/unitree_actuator_sdk-GO-M8010-6/example/uart_get.py", "r");
+    if (!pipe) {
+        cerr << "Failed to open pipe." << endl;
+        return -1;
+    }
+
+    char buffer[128];
+    auto start_time = steady_clock::now();
+    while (fgets(buffer, sizeof(buffer), pipe) != nullptr) {
+        int value = std::stoi(buffer);
+        cout << "收到串口的AD值: " << value << endl;
+
+        cmd.motorType = MotorType::GO_M8010_6;
+        cmd.id = 2;
+        cmd.mode = 1; 
+        cmd.K_P = 0.1;
+        cmd.K_W = 0.05;
+        double targetPos = 6.33 * value * 0.002 * PI + init_Pos[2];
+        cmd.Pos = targetPos;
+        serial.sendRecv(&cmd, &data);
+        cout << "已旋转: " << value * 0.36 << "度" << endl;
+
+        // 记录轨迹
+        if (isRecording) {
+            auto now = steady_clock::now();
+            double time_elapsed = duration<double>(now - start_time).count();
+            trajectory.emplace_back(time_elapsed, targetPos);
+        }
+
+        // 按 'y' 停止记录
+        if (kbhit() && getch() == 'y') {
+            isRecording = false;
+            cout << "记录结束。请用电位器手动归位电机。" << endl;
+            break;
+        }
+    }
+    pclose(pipe);
+
+    // 归位阶段，继续监听电位器数据
+    cout << "请手动归位电机，按 'y' 开始复现..." << endl;
+    pipe = popen("python3 /home/jetson/zhb1230/unitree_actuator_sdk-GO-M8010-6/example/uart_get.py", "r");
+    if (!pipe) {
+        cerr << "Failed to open pipe for returning stage." << endl;
+        return -1;
+    }
+
+    while (isReturning) {
+        if (fgets(buffer, sizeof(buffer), pipe) != nullptr) {
+            int value = std::stoi(buffer);
+            cmd.motorType = MotorType::GO_M8010_6;
+            cmd.id = 2;
+            cmd.mode = 1; 
+            cmd.K_P = 0.1;
+            cmd.K_W = 0.05;
+            double targetPos = 6.33 * value * 0.002 * PI + init_Pos[2];
+            cmd.Pos = targetPos;
+            serial.sendRecv(&cmd, &data);
+            cout << "归位中: " << value * 0.36 << "度" << endl;
+        }
+
+        // 按 'y' 结束归位
+        if (kbhit() && getch() == 'y') {
+            isReturning = false;
+            cout << "归位完成，开始复现..." << endl;
+        }
+    }
+    pclose(pipe);
+
+    // 复现轨迹
+    auto replay_start_time = steady_clock::now();
+    for (const auto& point : trajectory) {
+        while (true) {
+            auto now = steady_clock::now();
+            double elapsed = duration<double>(now - replay_start_time).count();
+            if (elapsed >= point.first) {
+                cmd.motorType = MotorType::GO_M8010_6;
+                cmd.id = 2;
+                cmd.mode = 1; 
+                cmd.K_P = 0.1;
+                cmd.K_W = 0.05;
+                cmd.Pos = point.second;
+                serial.sendRecv(&cmd, &data);
+                cout << "复现: 时间 " << point.first << " s, 位置 " << point.second << " rad" << endl;
+                break;
+            }
+            usleep(1000);
+        }
+    }
+    cout << "复现结束。" << endl;
+
+    return 0;
+}

@@ -1,0 +1,134 @@
+#include <iostream>
+#include <cstdio>
+#include "serialPort/SerialPort.h"
+#include <unistd.h>
+#include <math.h>
+#define MOTOR_COUNT 3        // 电机数量
+#define TIME_STEP 0.01       // 控制周期
+#define PI 3.1415926
+#include <cstdlib>
+
+// 五次多项式规划
+double S5_Plan(double S_Pos, double all_t, double t) {
+    return (10 * pow(t, 3) / pow(all_t, 3) - 15 * pow(t, 4) / pow(all_t, 4) + 6 * pow(t, 5) / pow(all_t, 5)) * S_Pos;
+}
+
+int main() {
+    SerialPort serial("/dev/ttyUSB0");
+    MotorCmd cmd;
+    MotorData data;
+    usleep(1000000);
+
+    // 记录上电时电机初始位置
+    double init_Pos[MOTOR_COUNT];
+    for (int i = 0; i < MOTOR_COUNT; i++) {
+        cmd.motorType = MotorType::GO_M8010_6;
+        cmd.id = i;
+        cmd.mode = 0; // 读取模式
+        serial.sendRecv(&cmd, &data);
+        init_Pos[i] = data.Pos; // 保存初始位置
+        printf("Motor %d Init Pos: %f rad\n", i, data.Pos);
+        usleep(200);
+    }
+
+    // 使用 popen 调用 Python 程序，并读取其输出
+    FILE* pipe = popen("python3 /home/jetson/zhb1230/unitree_actuator_sdk-GO-M8010-6/example/uart_get.py", "r");
+    if (!pipe) {
+        std::cerr << "Failed to open pipe." << std::endl;
+        return -1;
+    }
+
+    // 初始化 T 值
+    double T1 = 0.0; // Motor 1 的当前 T 值
+    double T2 = 0.0; // Motor 2 的当前 T 值
+     double T3 = 0.0; // Motor 2 的当前 T 值
+    const double smooth_factor = 0.1; // 平滑系数，值越小越平滑
+
+    char buffer[128];
+    while (fgets(buffer, sizeof(buffer), pipe) != nullptr) {
+        int motor_id, value;
+        sscanf(buffer, "%01d%d\n", &motor_id, &value);
+        std::cout << "Received AD value for Motor ID " << motor_id << ": " << value << std::endl;
+
+        if (motor_id == 1) {
+            // 设置 Motor 1 的目标 T 值
+            double target_T1 = 0.0;
+            if (value < 250) {
+                target_T1 = 0.4;
+            } else if (value > 250) {
+                target_T1 = -0.3;
+            }
+
+            // 平滑调整 T 值
+            T1 = T1 + (target_T1 - T1) * smooth_factor;
+
+            // 控制 Motor 1
+            cmd.motorType = MotorType::GO_M8010_6;
+            cmd.id = 1;
+            cmd.mode = 1; // 位置控制模式
+            cmd.K_P = 0.2;
+            cmd.K_W = 0.07;
+            cmd.T = T1;
+            cmd.Pos = 6.33 * value * 0.002 * 3.1415926 * 0.75 + init_Pos[1];
+            serial.sendRecv(&cmd, &data);
+            std::cout << "id1已旋转: " << value * 0.36 * 0.75 << "度, T = " << T1 << std::endl;
+        }
+
+        if (motor_id == 2) {
+            // 设置 Motor 2 的目标 T 值
+            double target_T2 = 0.0;
+            if (value > 750) {
+                target_T2 = -0.6;
+            } else if (value < 750) {
+                target_T2 = -1.0;
+            }
+            if (value < 600) {
+                target_T2 = -2.0;
+            }
+
+            // 平滑调整 T 值
+           // T2 = T2 + (target_T2 - T2) * smooth_factor;
+            T2 = 0.7;
+            // 控制 Motor 2
+            cmd.motorType = MotorType::GO_M8010_6;
+            cmd.id = 2;
+            cmd.mode = 1; // 位置控制模式
+            cmd.K_P = 0.2;
+            cmd.K_W = 0.07;
+            cmd.T = T2;
+            cmd.Pos = -6.33 * (1000 - value) * 0.002 * 3.1415926 * 0.75 + init_Pos[2];
+            serial.sendRecv(&cmd, &data);
+            std::cout << "id2已旋转: " << (1000 - value) * 0.36 * 0.75 << "度, T = " << T2 << std::endl;
+        }
+        if (motor_id == 3 ){
+            // 设置 Motor 2 的目标 T 值
+            double target_T3 = 0.0;
+            if (value > 750) {
+                target_T3 = 0;
+            } else if (value < 750) {
+                target_T3 = 0;
+            }
+            if (value < 600) {
+                target_T3 = 0;
+            }
+
+            // 平滑调整 T 值
+            T3 = T3 + (target_T3 - T3) * smooth_factor;
+
+            // 控制 Motor3
+            cmd.motorType = MotorType::GO_M8010_6;
+            cmd.id = 0;
+            cmd.mode = 1; // 位置控制模式
+            cmd.K_P = 0.2;
+            cmd.K_W = 0.07;
+            cmd.T = T3;
+            cmd.Pos = -6.33 * value * 0.002 * 3.1415926 * 0.75 + init_Pos[0];
+            serial.sendRecv(&cmd, &data);
+            std::cout << "id0已旋转: " << value * 0.36 * 0.75 << "度, T = " << T3 << std::endl;
+        }    
+        
+    }
+
+    pclose(pipe);
+    return 0;
+}
