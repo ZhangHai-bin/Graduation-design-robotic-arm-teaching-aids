@@ -33,4 +33,4 @@
 
 博客：www.haibinzone.cn
 
-邮箱：www.zhb0032024@163.com（请替换）
+邮箱：www.zhb0032024@163.com
